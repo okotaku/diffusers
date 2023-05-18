@@ -258,6 +258,8 @@ class StableDiffusionReferencePipeline(StableDiffusionPipeline):
             style_fidelity (`float`):
                 style fidelity of ref_uncond_xt. If style_fidelity=1.0, control more important,
                 elif style_fidelity=0.0, prompt more important, else balanced.
+            reference_out_of_transformer (`bool`):
+                Whether to calculate reference_latent out of transformer hidden features.
             reference_attn (`bool`):
                 Whether to use reference query for self attention's context.
             reference_adain (`bool`):
