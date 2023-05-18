@@ -182,8 +182,10 @@ class StableDiffusionReferencePipeline(StableDiffusionPipeline):
         attention_auto_machine_weight: float = 1.0,
         gn_auto_machine_weight: float = 1.0,
         style_fidelity: float = 0.5,
+        reference_out_of_transformer: bool = True,
         reference_attn: bool = True,
         reference_adain: bool = True,
+        **kwargs
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -273,7 +275,8 @@ class StableDiffusionReferencePipeline(StableDiffusionPipeline):
         assert reference_attn or reference_adain, "`reference_attn` or `reference_adain` must be True."
 
         # 0. Default height and width to unet
-        height, width = self._default_height_width(height, width, ref_image)
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -317,6 +320,7 @@ class StableDiffusionReferencePipeline(StableDiffusionPipeline):
         )
 
         # 5. Prepare timesteps
+        total_timesteps = len(self.scheduler.timesteps)
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
@@ -398,14 +402,17 @@ class StableDiffusionReferencePipeline(StableDiffusionPipeline):
                             # attention_mask=attention_mask,
                             **cross_attention_kwargs,
                         )
-                        attn_output_c = attn_output_uc.clone()
-                        if do_classifier_free_guidance and style_fidelity > 0:
-                            attn_output_c[uc_mask] = self.attn1(
-                                norm_hidden_states[uc_mask],
-                                encoder_hidden_states=norm_hidden_states[uc_mask],
-                                **cross_attention_kwargs,
-                            )
-                        attn_output = style_fidelity * attn_output_c + (1.0 - style_fidelity) * attn_output_uc
+                        if reference_out_of_transformer:
+                            attn_output = attn_output_uc
+                        else:
+                            attn_output_c = attn_output_uc.clone()
+                            if do_classifier_free_guidance and style_fidelity > 0:
+                                attn_output_c[uc_mask] = self.attn1(
+                                    norm_hidden_states[uc_mask],
+                                    encoder_hidden_states=norm_hidden_states[uc_mask],
+                                    **cross_attention_kwargs,
+                                )
+                            attn_output = style_fidelity * attn_output_c + (1.0 - style_fidelity) * attn_output_uc
                         self.bank.clear()
                     else:
                         attn_output = self.attn1(
@@ -706,14 +713,27 @@ class StableDiffusionReferencePipeline(StableDiffusionPipeline):
 
                 # ref only part
                 noise = torch.randn_like(ref_image_latents)
-                ref_xt = self.scheduler.add_noise(
-                    ref_image_latents,
-                    noise,
-                    t.reshape(
-                        1,
-                    ),
-                )
+                ref_xt = self.scheduler.add_noise(ref_image_latents, noise, t)
                 ref_xt = self.scheduler.scale_model_input(ref_xt, t)
+                if do_classifier_free_guidance and reference_out_of_transformer:
+                    if style_fidelity == 0.0:
+                        # Control More Important
+                        ref_uncond_xt = latent_model_input.clone()
+                    elif style_fidelity == 1.0:
+                        # Prompt More Important
+                        ref_uncond_xt = ref_xt.clone()
+                    else:
+                        time_weight = (
+                            t.float().reshape(
+                                1,
+                            )
+                            / total_timesteps
+                        )
+                        time_weight = (time_weight > style_fidelity).type_as(ref_xt)
+                        time_weight = time_weight[:, None, None, None]
+                        ref_uncond_xt = latent_model_input * time_weight + ref_xt * (1 - time_weight)
+
+                    ref_xt = ref_xt * ~uc_mask[:, None, None, None] + ref_uncond_xt * uc_mask[:, None, None, None]
 
                 MODE = "write"
                 self.unet(
